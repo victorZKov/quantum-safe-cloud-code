@@ -1,0 +1,92 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: users-api
+  namespace: production
+  labels:
+    app: users-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: users-api
+  template:
+    metadata:
+      labels:
+        app: users-api
+    spec:
+      serviceAccountName: users-api-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: users-api
+          image: acrquantumapi.azurecr.io/users-api:latest
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 443   # mTLS
+              name: https
+            - containerPort: 8080  # Health check (no mTLS)
+              name: health
+
+          env:
+            - name: ASPNETCORE_URLS
+              value: "https://+:443;http://+:8080"
+            - name: QuantumApi__BaseUrl
+              value: "https://api.quantumapi.eu"
+            - name: QuantumApi__ServiceName
+              value: "users-api"
+            - name: QuantumApi__ApiKey
+              valueFrom:
+                secretKeyRef:
+                  name: quantumapi-credentials
+                  key: api-key
+            - name: Services__OrdersUrl
+              value: "https://orders-service.production.svc.cluster.local"
+            - name: Services__NotificationsUrl
+              value: "https://notifications-service.production.svc.cluster.local"
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

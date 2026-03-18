@@ -1,0 +1,40 @@
+# trivy-config.yaml
+# Trivy configuration for the quantum-safe CI/CD pipeline
+# Reference: https://aquasecurity.github.io/trivy/latest/docs/references/configuration/config-file/
+
+scan:
+  # Scan types to run
+  scanners:
+    - vuln       # Known CVE vulnerabilities in packages
+    - secret     # Hardcoded secrets and credentials
+    - misconfig  # IaC misconfigurations (Dockerfile, k8s YAML)
+
+vulnerability:
+  # Only fail on vulnerabilities that have a fix available
+  # Unfixed vulnerabilities are reported but don't break the build
+  ignore-unfixed: true
+
+# Severity thresholds — only HIGH and CRITICAL break the build
+# (set via --severity flag in the pipeline, this is for reference)
+severity:
+  - HIGH
+  - CRITICAL
+
+# Ignore specific CVEs that are accepted risks
+# Document the reason and review date for each entry
+ignore:
+  - id: CVE-2024-XXXXX
+    reason: "Affects only test helpers, not production code. Review: 2026-06-01"
+
+# Secret scanning: block these patterns
+secret:
+  config: trivy-secret.yaml
+
+# Output formats
+format: sarif
+output: trivy-results.sarif
+
+# Cache settings
+cache:
+  dir: /tmp/.trivy-cache
+  backend: fs

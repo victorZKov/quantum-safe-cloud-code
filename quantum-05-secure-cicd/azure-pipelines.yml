@@ -1,0 +1,350 @@
+# azure-pipelines.yml
+# Quantum-safe CI/CD pipeline for quantum-05-secure-cicd article
+#
+# Stages:
+#   1. build     — restore, build, test
+#   2. scan      — Trivy vulnerability scan + CycloneDX SBOM
+#   3. image     — Build Docker image, sign with Cosign (key from QuantumVault)
+#   4. deploy    — Rolling update to AKS
+#   5. smoketest — Health check + signature verify
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - "*.md"
+      - "docs/**"
+
+variables:
+  - group: quantum-api-secrets   # pipeline group: QAPI_API_KEY, COSIGN_SECRET_ID, COSIGN_VERIFY_SECRET_ID
+  - name: ACR_NAME
+    value: "acrquantumapi"
+  - name: IMAGE_NAME
+    value: "users-api"
+  - name: AKS_RESOURCE_GROUP
+    value: "rg-quantum-prod"
+  - name: AKS_CLUSTER
+    value: "aks-quantum-prod"
+  - name: K8S_NAMESPACE
+    value: "production"
+  - name: DOTNET_VERSION
+    value: "10.0.x"
+
+stages:
+  # ─────────────────────────────────────────────
+  # Stage 1: Build & Test
+  # ─────────────────────────────────────────────
+  - stage: Build
+    displayName: "Build & Test"
+    jobs:
+      - job: BuildJob
+        displayName: "Restore, Build, Test"
+        pool:
+          vmImage: "ubuntu-24.04"
+        steps:
+          - task: UseDotNet@2
+            displayName: "Use .NET $(DOTNET_VERSION)"
+            inputs:
+              version: $(DOTNET_VERSION)
+              includePreviewVersions: false
+
+          - script: |
+              dotnet restore --locked-mode
+            displayName: "Restore NuGet packages"
+            workingDirectory: "$(Build.SourcesDirectory)"
+
+          - script: |
+              dotnet build --no-restore --configuration Release
+            displayName: "Build (Release)"
+            workingDirectory: "$(Build.SourcesDirectory)"
+
+          - script: |
+              dotnet test --no-build --configuration Release \
+                --logger "trx;LogFileName=test-results.trx" \
+                --collect:"XPlat Code Coverage"
+            displayName: "Run tests"
+            workingDirectory: "$(Build.SourcesDirectory)"
+
+          - task: PublishTestResults@2
+            displayName: "Publish test results"
+            condition: always()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: "**/*.trx"
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@2
+            displayName: "Publish code coverage"
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: "**/coverage.cobertura.xml"
+
+  # ─────────────────────────────────────────────
+  # Stage 2: Security Scan + SBOM
+  # ─────────────────────────────────────────────
+  - stage: Scan
+    displayName: "Security Scan + SBOM"
+    dependsOn: Build
+    jobs:
+      - job: ScanJob
+        displayName: "Trivy + CycloneDX SBOM"
+        pool:
+          vmImage: "ubuntu-24.04"
+        steps:
+          # Install Trivy
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                | sh -s -- -b /usr/local/bin v0.62.1
+            displayName: "Install Trivy"
+
+          # Scan source code for vulnerabilities (fail on HIGH/CRITICAL)
+          - script: |
+              trivy fs . \
+                --config trivy-config.yaml \
+                --exit-code 1 \
+                --severity HIGH,CRITICAL \
+                --format sarif \
+                --output trivy-results.sarif
+            displayName: "Trivy filesystem scan"
+            workingDirectory: "$(Build.SourcesDirectory)"
+            continueOnError: false
+
+          # Publish SARIF to Azure DevOps Security tab
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Trivy SARIF"
+            inputs:
+              pathToPublish: "$(Build.SourcesDirectory)/trivy-results.sarif"
+              artifactName: "trivy-sarif"
+
+          # Install CycloneDX .NET tool
+          - script: |
+              dotnet tool install --global CycloneDX --version 3.0.1
+            displayName: "Install CycloneDX tool"
+
+          # Generate SBOM in CycloneDX JSON format
+          - script: |
+              dotnet CycloneDX . \
+                --output $(Build.ArtifactStagingDirectory)/sbom \
+                --json \
+                --github-bearer-token $(GITHUB_TOKEN)
+            displayName: "Generate CycloneDX SBOM"
+            workingDirectory: "$(Build.SourcesDirectory)"
+            env:
+              GITHUB_TOKEN: $(GITHUB_TOKEN)
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish SBOM artifact"
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/sbom"
+              artifactName: "sbom-cyclonedx"
+
+  # ─────────────────────────────────────────────
+  # Stage 3: Build Image + Cosign Signing
+  # ─────────────────────────────────────────────
+  - stage: Image
+    displayName: "Build & Sign Container Image"
+    dependsOn: Scan
+    jobs:
+      - job: ImageJob
+        displayName: "Docker build, push, and Cosign sign"
+        pool:
+          vmImage: "ubuntu-24.04"
+        steps:
+          # Install qapi CLI
+          # The binary is available at the QuantumAPI GitHub releases page.
+          # Check https://github.com/quantumapi-eu/qapi/releases for the latest.
+          # TODO: pin to a specific version when qapi publishes versioned releases
+          - script: |
+              curl -sSL https://github.com/quantumapi-eu/qapi/releases/latest/download/qapi-linux-amd64 \
+                -o /usr/local/bin/qapi
+              chmod +x /usr/local/bin/qapi
+              qapi health
+            displayName: "Install qapi CLI"
+            env:
+              QAPI_API_KEY: $(QAPI_API_KEY)
+
+          # Retrieve Cosign signing key from QuantumVault.
+          # The private key was stored as a secret during one-time setup
+          # (see setup-pipeline-secrets.sh). COSIGN_SECRET_ID is the secret ID
+          # from `qapi secrets list`.
+          - script: |
+              qapi secrets get "$(COSIGN_SECRET_ID)" --show --output json \
+                | jq -r .value > /tmp/cosign.key
+              chmod 600 /tmp/cosign.key
+            displayName: "Fetch Cosign signing key from QuantumVault"
+            env:
+              QAPI_API_KEY: $(QAPI_API_KEY)
+
+          # Log in to ACR
+          - task: AzureCLI@2
+            displayName: "ACR login"
+            inputs:
+              azureSubscription: "azure-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az acr login --name $(ACR_NAME)
+
+          # Build image with full tag (registry/name:sha)
+          - script: |
+              IMAGE_TAG="$(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(Build.SourceVersion)"
+              echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+              docker build \
+                --tag "$IMAGE_TAG" \
+                --label "org.opencontainers.image.source=$(Build.Repository.Uri)" \
+                --label "org.opencontainers.image.revision=$(Build.SourceVersion)" \
+                --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                .
+            displayName: "Docker build"
+            workingDirectory: "$(Build.SourcesDirectory)"
+
+          # Push image to ACR
+          - script: |
+              docker push "$(IMAGE_TAG)"
+            displayName: "Docker push"
+
+          # Install Cosign
+          - script: |
+              curl -sSL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 \
+                -o /usr/local/bin/cosign
+              chmod +x /usr/local/bin/cosign
+            displayName: "Install Cosign v2.4.1"
+
+          # Sign image with the key retrieved from QuantumVault
+          - script: |
+              cosign sign \
+                --key /tmp/cosign.key \
+                --tlog-upload=false \
+                "$(IMAGE_TAG)"
+              rm -f /tmp/cosign.key
+            displayName: "Sign image with Cosign"
+
+          # Attach SBOM to the image
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: current
+              artifactName: "sbom-cyclonedx"
+              downloadPath: "$(Pipeline.Workspace)"
+
+          - script: |
+              cosign attach sbom \
+                --sbom "$(Pipeline.Workspace)/sbom-cyclonedx/bom.json" \
+                --type cyclonedx \
+                "$(IMAGE_TAG)"
+            displayName: "Attach CycloneDX SBOM to image"
+
+          # Store IMAGE_TAG for deploy stage
+          - script: |
+              echo "$(IMAGE_TAG)" > $(Build.ArtifactStagingDirectory)/image-tag.txt
+            displayName: "Save image tag"
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(Build.ArtifactStagingDirectory)/image-tag.txt"
+              artifactName: "image-tag"
+
+  # ─────────────────────────────────────────────
+  # Stage 4: Deploy to AKS
+  # ─────────────────────────────────────────────
+  - stage: Deploy
+    displayName: "Deploy to AKS"
+    dependsOn: Image
+    jobs:
+      - deployment: DeployAKS
+        displayName: "Rolling deploy to AKS"
+        environment: "production"
+        pool:
+          vmImage: "ubuntu-24.04"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    buildType: current
+                    artifactName: "image-tag"
+                    downloadPath: "$(Pipeline.Workspace)"
+
+                - task: AzureCLI@2
+                  displayName: "Get AKS credentials"
+                  inputs:
+                    azureSubscription: "azure-service-connection"
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az aks get-credentials \
+                        --resource-group $(AKS_RESOURCE_GROUP) \
+                        --name $(AKS_CLUSTER) \
+                        --overwrite-existing
+
+                - script: |
+                    IMAGE_TAG=$(cat $(Pipeline.Workspace)/image-tag/image-tag.txt)
+                    kubectl set image deployment/users-api \
+                      users-api="$IMAGE_TAG" \
+                      --namespace $(K8S_NAMESPACE)
+                    kubectl rollout status deployment/users-api \
+                      --namespace $(K8S_NAMESPACE) \
+                      --timeout=300s
+                  displayName: "Rolling update users-api"
+
+  # ─────────────────────────────────────────────
+  # Stage 5: Smoke Test
+  # ─────────────────────────────────────────────
+  - stage: Smoketest
+    displayName: "Smoke Test"
+    dependsOn: Deploy
+    jobs:
+      - job: SmokeJob
+        displayName: "Health check + signature verify"
+        pool:
+          vmImage: "ubuntu-24.04"
+        steps:
+          # TODO: pin to a specific version when qapi publishes versioned releases
+          - script: |
+              curl -sSL https://github.com/quantumapi-eu/qapi/releases/latest/download/qapi-linux-amd64 \
+                -o /usr/local/bin/qapi
+              chmod +x /usr/local/bin/qapi
+            displayName: "Install qapi CLI"
+
+          - script: |
+              curl -sSL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 \
+                -o /usr/local/bin/cosign
+              chmod +x /usr/local/bin/cosign
+            displayName: "Install Cosign v2.4.1"
+
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              buildType: current
+              artifactName: "image-tag"
+              downloadPath: "$(Pipeline.Workspace)"
+
+          - script: |
+              set -e
+
+              BASE_URL="https://api.quantum-prod.example.com"
+
+              # 1. Health check
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/health")
+              if [ "$HTTP_STATUS" != "200" ]; then
+                echo "Health check failed: HTTP $HTTP_STATUS"
+                exit 1
+              fi
+              echo "Health check: OK ($HTTP_STATUS)"
+
+              # 2. Fetch the Cosign public key from QuantumVault and verify image signature
+              IMAGE_TAG=$(cat $(Pipeline.Workspace)/image-tag/image-tag.txt)
+
+              qapi secrets get "$(COSIGN_VERIFY_SECRET_ID)" --show --output json \
+                | jq -r .value > /tmp/cosign.pub
+
+              cosign verify \
+                --key /tmp/cosign.pub \
+                --insecure-ignore-tlog \
+                "$IMAGE_TAG"
+              rm -f /tmp/cosign.pub
+              echo "Image signature: verified"
+            displayName: "Health check + cosign verify"
+            env:
+              QAPI_API_KEY: $(QAPI_API_KEY)

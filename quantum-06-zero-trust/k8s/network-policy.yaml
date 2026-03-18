@@ -1,0 +1,82 @@
+---
+# NetworkPolicy: users-api
+# Allows only the specific services that legitimately need to call this API.
+# Everything else is denied at the CNI level (Calico / Cilium).
+#
+# Combined with mTLS at the application layer, this gives defence in depth:
+# - L3/L4: NetworkPolicy blocks packets from unknown pods
+# - L7: mTLS rejects connections without a valid QuantumAPI CA certificate
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: users-api-ingress
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: users-api
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow inbound from orders-service (mTLS port 443)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orders-service
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # Allow inbound from notifications-service (mTLS port 443)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: notifications-service
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # Allow health checks from the kubelet (non-mTLS, port 8080)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8080
+
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        - podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+
+    # Allow outbound to QuantumAPI CA for certificate issuance
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # Allow outbound to PostgreSQL
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgresql
+      ports:
+        - protocol: TCP
+          port: 5432
